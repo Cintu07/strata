@@ -192,14 +192,29 @@ class LookaheadResult:
     k: int
     budget: int
     persistence: float
+    static: float
     linear: float
     mlp: float
 
     def best_probe(self) -> float:
         return max(self.linear, self.mlp)
 
+    def free_baseline(self) -> float:
+        """the best recall obtainable without a probe at all.
+
+        both of these cost nothing at inference time, so a shipped probe has to
+        beat whichever is higher, not whichever is more flattering. the
+        persistence prior was the only one m0 originally compared against, and
+        on granite it is the weaker of the two by a wide margin, which made the
+        probe look better than it is.
+        """
+        return max(self.persistence, self.static)
+
+    def margin(self) -> float:
+        return self.best_probe() - self.free_baseline()
+
     def beats_baseline(self) -> bool:
-        return self.best_probe() > self.persistence
+        return self.margin() > 0.0
 
 
 def _split(n: int, train_frac: float) -> tuple[slice, slice]:
@@ -282,10 +297,22 @@ def lookahead_recall(
         # the prior needs no training, so it is scored on the same test rows
         persistence = recall_at(prior[mask_test], y_te, budget)
 
+        # the other free baseline: which experts are simply the most popular at
+        # layer L+k. it ignores the hidden state completely, it is a table of
+        # n_layers by n_experts counts built once when the model is profiled,
+        # and it costs nothing in the decode loop. counted on the training rows
+        # only, so it is scored on the same footing as the probes.
+        static_scores = np.zeros_like(y, dtype=np.float32)
+        for layer in range(n_layers_used):
+            base = layer * n_per_layer
+            counts = y[base + train.start : base + train.stop].sum(axis=0)
+            static_scores[base : base + n_per_layer] = counts
+        static = recall_at(static_scores[mask_test], y_te, budget)
+
         linear = recall_at(LinearProbe().fit(x_tr, y_tr).predict(x_te), y_te, budget)
         mlp = recall_at(
             MlpProbe(seed=seed).fit(x_tr, y_tr).predict(x_te), y_te, budget
         )
 
-        results.append(LookaheadResult(k, budget, persistence, linear, mlp))
+        results.append(LookaheadResult(k, budget, persistence, static, linear, mlp))
     return results
