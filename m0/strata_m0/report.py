@@ -156,6 +156,8 @@ def plot_prediction(results: list[predict.LookaheadResult], out: Path) -> Path:
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(ks, [r.persistence for r in results], marker="s", color="#c1440e",
             label="persistence prior, free")
+    ax.plot(ks, [r.static for r in results], marker="^", color="#7a5c00",
+            label="static frequency prior, free")
     ax.plot(ks, [r.linear for r in results], marker="o", color="#e0a458", label="linear probe")
     ax.plot(ks, [r.mlp for r in results], marker="^", color="#3c6e91", label="mlp probe")
     ax.axhline(0.9, color="#555", ls=":", label="m5 target, 0.90")
@@ -197,9 +199,29 @@ def run(trace: RouterTrace, out_dir: str | Path, target_fraction: float = 0.2) -
         for name, series in sim.items()
     }
 
+    # a decoder walks every layer of every token in order, so one token is a
+    # scan over n_layers * top_k distinct pairs. below that, recency evicts each
+    # pair exactly before its next use. this measures the step rather than
+    # asserting it, because a zero in a results table that is not explained
+    # reads as a broken simulator.
+    keys = trace.flat_keys()
+    per_token = trace.n_layers * trace.top_k
+    cliff = {
+        "per_token": per_token,
+        "target_capacity": target_capacity,
+        "lru_below": cache_sim.lru(keys, max(1, per_token - 1)).hit_rate,
+        "lru_at": cache_sim.lru(keys, per_token).hit_rate,
+    }
+
     prediction: list[predict.LookaheadResult] = []
     if trace.has_hidden:
         prediction = predict.lookahead_recall(trace)
+
+    domain = None
+    null = None
+    if trace.has_segments:
+        domain = analysis.domain_correlation(trace, trace.segments.tolist())
+        null = analysis.domain_null(trace, trace.segments.tolist())
 
     plot_reuse(trace, figures / "reuse.png")
     plot_skew(trace, figures / "skew.png")
@@ -240,6 +262,26 @@ def run(trace: RouterTrace, out_dir: str | Path, target_fraction: float = 0.2) -
         ),
     ]
 
+    if null is not None and null.n_shifts:
+        # graded on the permutation p rather than on the margin, because the
+        # margin is a difference of two cosines and has no scale anyone can read.
+        if null.p_value <= 0.01:
+            verdict = PASS
+        elif null.p_value <= 0.05:
+            verdict = MARGINAL
+        else:
+            verdict = FAIL
+        checks.append(
+            Check(
+                "subject separation survives a circular shift null",
+                verdict,
+                null.margin,
+                0.0,
+                "if routing is the same whatever the text is about, frequency "
+                "buys nothing over recency and lru is the right policy",
+            )
+        )
+
     k4 = next((r for r in prediction if r.k == 4), None)
     if k4 is not None:
         checks.append(
@@ -253,25 +295,46 @@ def run(trace: RouterTrace, out_dir: str | Path, target_fraction: float = 0.2) -
         )
         checks.append(
             Check(
-                "probe beats the free persistence prior at k=4",
-                PASS if k4.beats_baseline() else FAIL,
-                k4.best_probe() - k4.persistence,
-                0.0,
-                "a probe that cannot beat a prior costing nothing should not be shipped",
+                "probe beats the best free baseline at k=4",
+                _verdict(k4.margin(), 0.05),
+                k4.margin(),
+                0.05,
+                "a probe that barely beats a table costing nothing should not be "
+                "shipped, and 0.05 recall is the least that could pay for one",
             )
         )
 
     report = _write_markdown(
-        trace, checks, reuse, skew, coact, sim, at_target, prediction, out_dir
+        trace, checks, reuse, skew, coact, sim, at_target, cliff, prediction,
+        domain, null, out_dir,
     )
 
     summary = {
         "provenance": trace.provenance.to_dict(),
         "is_real_measurement": trace.provenance.is_real,
         "reuse_overall": reuse.overall,
+        "domain": None
+        if domain is None
+        else {
+            "within": domain.within,
+            "across": domain.across,
+            "separation": domain.separation,
+        },
+        "domain_null": None
+        if null is None or not null.n_shifts
+        else {
+            "observed": null.observed,
+            "null_mean": null.null_mean,
+            "null_p95": null.null_p95,
+            "margin": null.margin,
+            "p_value": null.p_value,
+            "n_shifts": null.n_shifts,
+            "aligned_discarded": null.aligned,
+        },
         "gini_mean": float(skew.gini.mean()),
         "coactivation": coact,
         "hit_rate_at_target": at_target,
+        "lru_cliff": cliff,
         "checks": [
             {"name": c.name, "verdict": c.verdict, "value": c.value, "threshold": c.threshold}
             for c in checks
@@ -281,6 +344,9 @@ def run(trace: RouterTrace, out_dir: str | Path, target_fraction: float = 0.2) -
                 "k": r.k,
                 "budget": r.budget,
                 "persistence": r.persistence,
+                "static": r.static,
+                "free_baseline": r.free_baseline(),
+                "margin": r.margin(),
                 "linear": r.linear,
                 "mlp": r.mlp,
             }
@@ -299,7 +365,10 @@ def _write_markdown(
     coact: dict[str, float],
     sim: dict[str, list[cache_sim.SimResult]],
     at_target: dict[str, float],
+    cliff: dict[str, float],
     prediction: list[predict.LookaheadResult],
+    domain: analysis.DomainResult | None,
+    null: analysis.DomainNull | None,
     out_dir: Path,
 ) -> Path:
     failed = [c for c in checks if c.verdict == FAIL]
@@ -360,6 +429,8 @@ def _write_markdown(
         "![reuse](figures/reuse.png)",
         "",
         "the persistence prior is this number. it costs nothing, needs no model, "
+        "and it is one of the two free baselines a prefetcher has to beat. it is "
+        "the weaker one. see section 5. "
         "and is the baseline the speculative router head has to beat before it is "
         "worth its complexity.",
         "",
@@ -388,6 +459,26 @@ def _write_markdown(
         "this is the figure that answers the question every actual user has, which "
         "is how much ram they need for their model.",
         "",
+        f"**lru reads {at_target.get('lru', 0.0):.3f} here and that is not a "
+        f"broken simulator.** one token touches {cliff['per_token']:.0f} "
+        f"distinct expert-layer pairs, {trace.n_layers} layers at "
+        f"top-{trace.top_k}, and the budget being judged holds "
+        f"{cliff['target_capacity']:.0f}. a cyclic scan over more distinct items "
+        f"than the cache holds evicts every one of them exactly before it is "
+        f"next needed, which is the worst case for pure recency, and it is not a "
+        f"rare corner: it is what a decoder does to any cache smaller than one "
+        f"token's working set.",
+        "",
+        f"the step is measured, not assumed. at {cliff['per_token'] - 1:.0f} "
+        f"pairs lru gets {cliff['lru_below']:.3f}, and at {cliff['per_token']:.0f} "
+        f"pairs it gets {cliff['lru_at']:.3f}.",
+        "",
+        f"that is the argument for admission control in one number. lfu reads "
+        f"{at_target.get('lfu', 0.0):.3f} on the same trace at the same budget, "
+        f"because frequency survives a scan that recency cannot, and it is why "
+        f"the strata cache puts a probationary window in front of the main "
+        f"region rather than running one lru list.",
+        "",
         "## 4. co-activation structure",
         "",
         f"joint routing runs at **{coact['lift']:.2f}x** what independent routing "
@@ -404,12 +495,65 @@ def _write_markdown(
         "",
     ]
 
+    if domain is not None:
+        lines[-2:-2] = [
+            "## 4b. does routing depend on the subject",
+            "",
+            f"routing profiles are **{domain.within:.3f}** similar between two "
+            f"windows of the same subject and **{domain.across:.3f}** similar "
+            f"between windows of different subjects, a separation of "
+            f"**{domain.separation:+.3f}**. similarity is cosine over access "
+            f"counts across expert-layer pairs, which does not saturate the way "
+            f"set overlap does.",
+            "",
+            "this is the claim the cache policy rests on. the eviction score is "
+            "frequency based rather than purely recency based because a topic is "
+            "supposed to have a stable expert set that survives a digression. a "
+            "separation near zero would mean lru is the right policy and the "
+            "extra machinery is not earning its place.",
+            "",
+        ]
+
+    if null is not None and null.n_shifts:
+        explained = null.null_mean / null.observed if null.observed > 0 else 0.0
+        lines[-2:-2] = [
+            "that separation cannot be read on its own. windows inside one "
+            "subject are also adjacent in time, so some of it is temporal "
+            "locality rather than subject matter. shifting the window positions "
+            "circularly against the same boundaries keeps the block sizes, the "
+            "contiguity and the time distances and destroys only the alignment "
+            "with the actual subjects.",
+            "",
+            "| | separation |",
+            "|---|---|",
+            f"| observed | {null.observed:+.3f} |",
+            f"| circular shift null, mean | {null.null_mean:+.3f} |",
+            f"| circular shift null, p95 | {null.null_p95:+.3f} |",
+            f"| margin over p95 | {null.margin:+.3f} |",
+            f"| p over {null.n_shifts} shifts | {null.p_value:.3f} |",
+            "",
+            f"{null.aligned} further shifts were discarded because they mapped "
+            f"each subject onto another subject and so reproduced the real "
+            f"boundaries exactly. the subjects here are close to equal length, "
+            f"which is what makes that happen, and scoring the observed value "
+            f"against copies of itself would have cost the test most of its "
+            f"power.",
+            "",
+            f"**the null already explains {explained:.0%} of the separation.** "
+            f"what is left is real at p={null.p_value:.3f} and small. routing "
+            f"here is mostly a property of position in the text, not of what the "
+            f"text is about, and that is a weaker result than the prd assumes.",
+            "",
+        ]
+
     if prediction:
         lines += [
-            "| k | prefetch budget | persistence prior | linear probe | mlp probe |",
-            "|---|---|---|---|---|",
+            "| k | budget | persistence prior | static prior | linear probe "
+            "| mlp probe | margin |",
+            "|---|---|---|---|---|---|---|",
             *[
-                f"| {r.k} | {r.budget} | {r.persistence:.3f} | {r.linear:.3f} | {r.mlp:.3f} |"
+                f"| {r.k} | {r.budget} | {r.persistence:.3f} | {r.static:.3f} | "
+                f"{r.linear:.3f} | {r.mlp:.3f} | {r.margin():+.3f} |"
                 for r in prediction
             ],
             "",
@@ -417,6 +561,24 @@ def _write_markdown(
             "",
             "recall, not accuracy, because a false positive costs bandwidth and a "
             "false negative costs a full stall. prefetching a superset is fine.",
+            "",
+            "**margin is against the better of the two free baselines**, not "
+            "against the persistence prior alone. the static prior is a table of "
+            "per-layer expert popularity built once when the model is profiled. "
+            "it reads the hidden state never, it costs nothing in the decode "
+            "loop, and here it beats the persistence prior at every k and beats "
+            "the linear probe at every k.",
+            "",
+            "read the margin column, not the probe column. the probe is the only "
+            "thing in this table that has to be trained, shipped and run inside "
+            "the decode loop, and what it buys over a table of counts is what it "
+            "has to justify itself with.",
+            "",
+            "note also that recall barely moves with k. that is not the good news "
+            "it looks like. a predictor that is no worse eight layers out than "
+            "one layer out is not using the lookahead, it is reproducing "
+            "something that does not depend on k, and a static popularity table "
+            "is exactly that. the flatness and the margin are the same fact.",
         ]
     else:
         lines += [
@@ -425,7 +587,27 @@ def _write_markdown(
             "depends on.",
         ]
 
+    density = trace.top_k / trace.n_experts
     lines += [
+        "",
+        "## what this run does not measure",
+        "",
+        f"this model activates **{density:.0%}** of its experts per layer per "
+        f"token, top-{trace.top_k} of {trace.n_experts}. the models this project "
+        f"exists for are far sparser, and density is not a detail: it sets the "
+        f"chance baselines every result here is read against. random routing "
+        f"would reuse {density:.3f} of its experts between consecutive tokens, "
+        f"and both free priors the probe has to beat are high for the same "
+        f"reason. the models the design targets route nearer 3 to 6 percent, so "
+        f"every baseline here moves on them and none of these numbers transfers "
+        f"without being measured again.",
+        "",
+        "which way they move is not known. it has not been measured here, and "
+        "guessing the direction is the thing this harness exists to avoid.",
+        "",
+        f"the corpus is {trace.n_tokens} tokens. that is enough to separate the "
+        f"effects reported here and not enough to put a confidence interval on "
+        f"any of them beyond the one null that carries a p value.",
         "",
         "---",
         "",
