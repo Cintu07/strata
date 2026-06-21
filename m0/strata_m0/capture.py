@@ -62,6 +62,25 @@ class CaptureConfig:
     seed: int = 0
     device: str = "cpu"
     dtype: str = "float32"
+
+    max_memory: str | None = None
+    """ram ceiling for the weights, e.g. ``"9GiB"``. when set, the model is
+    dispatched layer by layer and whatever does not fit is streamed from
+    ``offload_dir``.
+
+    this exists because the models worth measuring are the ones that do not fit.
+    olmoe-1b-7b is 13.8gb of weights against 15.6gb of host ram, and a plain
+    ``from_pretrained`` followed by ``.to(device)`` needs the whole thing
+    resident at once plus room for activations, so it dies after the download
+    rather than before it. m0 only needs router logits and a hidden state, so
+    there is no reason to hold the experts in memory at all.
+    """
+
+    offload_dir: str = "offload"
+    """where dispatched weights are streamed from. ignored unless
+    ``max_memory`` is set. put it on the fastest disk available, because the
+    forward pass reads through it."""
+
     extra_model_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -121,6 +140,7 @@ class RouterCapture:
         self._hidden: list[np.ndarray] = []
         self._projection: np.ndarray | None = None
         self._pending: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
+        self._segments: list[int] = []
         self.n_experts = infer_n_experts(model)
         self.top_k = config.top_k or infer_top_k(model)
         self.routers = find_routers(model, self.n_experts)
@@ -184,6 +204,17 @@ class RouterCapture:
             self._hidden.append(hidden.astype(np.float32))
         self._pending.clear()
 
+    def mark_segment(self) -> None:
+        """record that a new stretch of text starts at the next token.
+
+        called once per subject in the corpus, so the analysis can ask whether
+        routing depends on what is being talked about. cheap to record and
+        impossible to recover afterwards.
+        """
+        at = self.tokens_captured
+        if not self._segments or self._segments[-1] != at:
+            self._segments.append(at)
+
     @property
     def tokens_captured(self) -> int:
         return sum(r.shape[0] for r in self._routing)
@@ -198,10 +229,16 @@ class RouterCapture:
         if self._hidden:
             hidden = np.concatenate(self._hidden)[: self.config.max_tokens]
 
+        # a boundary past the truncation point describes text that is not in the
+        # trace, so drop it rather than carrying an index nothing can use
+        segments = [s for s in self._segments if s < routing.shape[0]]
+        segments_arr = np.array(sorted(set(segments)), dtype=np.int64) if segments else None
+
         return RouterTrace(
             routing=routing,
             n_experts=self.n_experts,
             hidden=hidden,
+            segments=segments_arr,
             provenance=Provenance(
                 source=SOURCE_CAPTURED,
                 model_id=self.config.model_id,
@@ -336,7 +373,11 @@ def infer_top_k(model: Any) -> int:
     )
 
 
-def capture_from_texts(config: CaptureConfig, texts: list[str]) -> RouterTrace:
+def capture_from_texts(
+    config: CaptureConfig,
+    texts: list[str],
+    segment_starts: set[int] | None = None,
+) -> RouterTrace:
     """load the model, run the texts through it, and return the trace.
 
     the convenience path. anything more involved than a list of strings is
@@ -346,18 +387,35 @@ def capture_from_texts(config: CaptureConfig, texts: list[str]) -> RouterTrace:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_id)
+
+    kwargs: dict[str, Any] = dict(config.extra_model_kwargs)
+    dispatched = config.max_memory is not None or "device_map" in kwargs
+    if config.max_memory is not None:
+        kwargs.setdefault("device_map", "auto")
+        kwargs.setdefault("max_memory", {config.device: config.max_memory})
+        kwargs.setdefault("offload_folder", config.offload_dir)
+        kwargs.setdefault("low_cpu_mem_usage", True)
+
     model = AutoModelForCausalLM.from_pretrained(
         config.model_id,
         dtype=getattr(torch, config.dtype),
-        **config.extra_model_kwargs,
+        **kwargs,
     )
-    model.eval().to(config.device)
+    model.eval()
+
+    # a dispatched model is already placed, and accelerate raises if it is moved
+    # again. only the all-in-memory path owns its placement.
+    if not dispatched:
+        model.to(config.device)
 
     capture = RouterCapture(model, config)
+    starts = segment_starts or set()
     with capture, torch.no_grad():
-        for text in texts:
+        for i, text in enumerate(texts):
             if capture.tokens_captured >= config.max_tokens:
                 break
+            if i in starts:
+                capture.mark_segment()
             batch = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
             model(**{k: v.to(config.device) for k, v in batch.items()})
     return capture.finish()
