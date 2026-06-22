@@ -21,6 +21,10 @@ import numpy as np
 
 SCHEMA_VERSION = 1
 
+REPLAY_VERSION = 1
+"""version of the routing-only format the rust crates replay. see
+[`RouterTrace.write_replay`] for the byte layout."""
+
 #: a trace that was captured from a real model on a real corpus
 SOURCE_CAPTURED = "captured"
 #: a trace generated with a known structure, for testing the harness itself
@@ -90,6 +94,14 @@ class RouterTrace:
     n_experts: int
     provenance: Provenance
     hidden: np.ndarray | None = None
+    segments: np.ndarray | None = None
+    """token index where each corpus segment began, ascending from 0.
+
+    a segment is a stretch of text about one thing. carrying the boundaries
+    makes it possible to ask whether routing depends on subject matter, which is
+    the claim the cache policy rests on and which cannot be recovered from the
+    routing alone.
+    """
 
     def __post_init__(self) -> None:
         if self.routing.ndim != 3:
@@ -104,6 +116,15 @@ class RouterTrace:
             )
         if self.routing.size and self.routing.min() < 0:
             raise ValueError("routing contains a negative expert index")
+        if self.segments is not None:
+            self.segments = np.ascontiguousarray(self.segments, dtype=np.int64)
+            if self.segments.size and (
+                self.segments.min() < 0 or self.segments.max() >= max(self.n_tokens, 1)
+            ):
+                raise ValueError(
+                    f"segment boundaries {self.segments.tolist()} fall outside "
+                    f"a trace of {self.n_tokens} tokens"
+                )
         if self.hidden is not None:
             if self.hidden.shape[:2] != self.routing.shape[:2]:
                 raise ValueError(
@@ -129,6 +150,10 @@ class RouterTrace:
     @property
     def has_hidden(self) -> bool:
         return self.hidden is not None
+
+    @property
+    def has_segments(self) -> bool:
+        return self.segments is not None and self.segments.size > 1
 
     def experts_at(self, token: int, layer: int) -> np.ndarray:
         """the distinct experts routed for one token at one layer."""
@@ -160,6 +185,8 @@ class RouterTrace:
         arrays = {"routing": self.routing}
         if self.hidden is not None:
             arrays["hidden"] = self.hidden
+        if self.segments is not None:
+            arrays["segments"] = self.segments
         meta = {
             "schema_version": SCHEMA_VERSION,
             "n_experts": self.n_experts,
@@ -183,10 +210,61 @@ class RouterTrace:
                 n_experts=meta["n_experts"],
                 provenance=Provenance.from_dict(meta["provenance"]),
                 hidden=f["hidden"] if "hidden" in f.files else None,
+                segments=f["segments"] if "segments" in f.files else None,
             )
+
+    def write_replay(self, path: str | Path) -> Path:
+        """write the routing only, in a form the rust crates can read.
+
+        # why a second format exists
+
+        the npz carries hidden states and is hundreds of megabytes, needs numpy
+        to open, and the rust crates deliberately have no dependencies. the
+        cache does not need any of that. it needs the access order and nothing
+        else, and that is 800kb rather than 200mb, small enough to live in the
+        repository so the replay is reproducible rather than described.
+
+        # layout, little endian
+
+        ```
+        0   8  magic "STRTRACE"
+        8   4  format version
+        12  4  n_tokens
+        16  4  n_layers
+        20  4  n_experts
+        24  4  top_k
+        28  .. n_tokens * n_layers * top_k u16 expert indices, token major
+        ```
+
+        expert indices rather than packed keys, so the reader has to rebuild the
+        expert-layer pair itself and the two sides cannot silently disagree
+        about the packing. u16 caps this at 65536 experts per layer, which is
+        two orders of magnitude past anything shipping.
+        """
+        if self.n_experts > 0xFFFF:
+            raise ValueError(
+                f"{self.n_experts} experts does not fit the u16 this format "
+                f"uses for an expert index"
+            )
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = (
+            b"STRTRACE"
+            + REPLAY_VERSION.to_bytes(4, "little")
+            + self.n_tokens.to_bytes(4, "little")
+            + self.n_layers.to_bytes(4, "little")
+            + self.n_experts.to_bytes(4, "little")
+            + self.top_k.to_bytes(4, "little")
+        )
+        body = self.routing.astype("<u2").tobytes()
+        path.write_bytes(header + body)
+        return path
 
     def describe(self) -> str:
         hidden = f", hidden dim {self.hidden.shape[2]}" if self.hidden is not None else ""
+        if self.has_segments:
+            hidden += f", {self.segments.size} segments"
         return (
             f"{self.n_tokens} tokens x {self.n_layers} layers x top-{self.top_k} "
             f"of {self.n_experts} experts{hidden}\n{self.provenance.banner()}"
