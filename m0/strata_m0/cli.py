@@ -39,7 +39,7 @@ def _capture(args: argparse.Namespace) -> int:
     from .capture import CaptureConfig, capture_from_texts
 
     if args.corpus:
-        texts = Path(args.corpus).read_text(encoding="utf-8").split("\n\n")
+        texts, starts = read_corpus(Path(args.corpus))
     else:
         print(
             "no --corpus given. a trace is only as representative as the text it "
@@ -57,12 +57,43 @@ def _capture(args: argparse.Namespace) -> int:
         probe_dim=args.probe_dim if args.hidden else 0,
         device=args.device,
         dtype=args.dtype,
+        max_memory=args.max_memory,
+        offload_dir=args.offload_dir,
     )
-    trace = capture_from_texts(config, [t for t in texts if t.strip()])
+    trace = capture_from_texts(config, texts, starts)
     path = trace.save(args.out)
     print(trace.describe())
     print(f"wrote {path}")
     return 0
+
+
+def read_corpus(path: Path) -> tuple[list[str], set[int]]:
+    """split a corpus into paragraphs, and note where the subject changes.
+
+    a line beginning with ``DOMAIN`` starts a new subject. everything between
+    two such lines is one subject, split into paragraphs on blank lines. the
+    markers are metadata and are not fed to the model.
+
+    routing is claimed to be domain correlated, and that claim is the whole
+    justification for a frequency based cache policy, so the corpus format
+    carries the information needed to check it.
+    """
+    texts: list[str] = []
+    starts: set[int] = set()
+    for block in path.read_text(encoding="utf-8").split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        if block.split("\n", 1)[0].strip().upper().startswith("DOMAIN"):
+            starts.add(len(texts))
+            rest = block.split("\n", 1)[1].strip() if "\n" in block else ""
+            if rest:
+                texts.append(rest)
+            continue
+        texts.append(block)
+    if not starts:
+        starts.add(0)
+    return texts, starts
 
 
 def _analyse(args: argparse.Namespace) -> int:
@@ -76,6 +107,20 @@ def _analyse(args: argparse.Namespace) -> int:
         print(
             "\nreminder: this trace is synthetic. the report says so at the top, "
             "and none of it is a result.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _export(args: argparse.Namespace) -> int:
+    trace = RouterTrace.load(args.trace)
+    print(trace.describe())
+    path = trace.write_replay(args.out)
+    print(f"wrote {path} ({path.stat().st_size / 1024:.0f} kb)")
+    if not trace.provenance.is_real:
+        print(
+            "\nthis trace is synthetic. replaying it through the rust cache "
+            "measures the generator, not a model.",
             file=sys.stderr,
         )
     return 0
@@ -110,6 +155,17 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--probe-dim", type=int, default=128)
     c.add_argument("--device", default="cpu")
     c.add_argument("--dtype", default="float32")
+    c.add_argument(
+        "--max-memory",
+        default=None,
+        help="ram ceiling for weights, e.g. 9GiB. streams the rest from disk, "
+        "which is how to capture a model larger than this machine's ram",
+    )
+    c.add_argument(
+        "--offload-dir",
+        default="offload",
+        help="where streamed weights live. only used with --max-memory",
+    )
     c.set_defaults(func=_capture)
 
     a = sub.add_parser("analyse", help="run every analysis and write the report")
@@ -117,6 +173,13 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--out", default="results")
     a.add_argument("--target-fraction", type=float, default=0.2)
     a.set_defaults(func=_analyse)
+
+    e = sub.add_parser(
+        "export", help="write the routing only, for replay through the rust cache"
+    )
+    e.add_argument("--trace", required=True)
+    e.add_argument("--out", default="../crates/strata-cache/tests/data/granite.route")
+    e.set_defaults(func=_export)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
