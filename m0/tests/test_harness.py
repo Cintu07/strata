@@ -278,3 +278,177 @@ def test_the_summary_records_that_a_synthetic_run_is_not_real(tmp_path):
     assert summary["is_real_measurement"] is False
     assert summary["checks"], "the verdict table should not be empty"
     assert all(c["verdict"] in {"pass", "marginal", "fail"} for c in summary["checks"])
+
+
+# --------------------------------------------------------- domain structure
+
+
+def test_domain_correlation_finds_structure_that_was_planted():
+    # four domains in blocks, which is what the synthetic generator builds
+    trace = make_trace(
+        n_tokens=1200, n_layers=4, n_experts=32, top_k=4,
+        n_domains=4, domain_block=300, persistence=0.0, seed=31, with_hidden=False,
+    )
+    result = analysis.domain_correlation(trace, boundaries=[0, 300, 600, 900], window=25)
+
+    assert result.within > result.across, str(result)
+    assert result.separation > 0.02, (
+        f"the generator puts a distinct hot set in each domain, so this should "
+        f"be clearly positive: {result}"
+    )
+
+
+def test_domain_correlation_finds_nothing_when_there_are_no_domains():
+    # one domain, so any apparent separation is an artefact of the estimator
+    trace = make_trace(
+        n_tokens=1200, n_layers=4, n_experts=32, top_k=4,
+        n_domains=1, domain_block=10_000, persistence=0.0, seed=32, with_hidden=False,
+    )
+    # the boundaries are a lie here on purpose: the text never changed subject
+    result = analysis.domain_correlation(trace, boundaries=[0, 300, 600, 900], window=25)
+
+    assert abs(result.separation) < 0.05, (
+        f"there is no domain structure to find, so separation should be near "
+        f"zero rather than positive: {result}"
+    )
+
+
+def test_domain_correlation_needs_at_least_two_domains():
+    trace = make_trace(n_tokens=200, n_layers=2, n_experts=8, top_k=2, with_hidden=False)
+    assert analysis.domain_correlation(trace, boundaries=[0]).separation == 0.0
+
+
+def test_the_domain_metric_does_not_saturate_at_real_model_shape():
+    """regression for the bug that made the first granite run report a false fail.
+
+    the first version took ``np.unique`` over a window of the routing tensor,
+    which both flattened the layers together and reduced to a set. at granite's
+    shape a 64 token window draws twelve thousand times from 768 expert-layer
+    pairs, so every pair appears, the jaccard index between any two windows is
+    exactly 1.0, and the metric reported 1.000 within and 1.000 across.
+    """
+    trace = make_trace(
+        n_tokens=1024, n_layers=24, n_experts=32, top_k=8,
+        n_domains=4, domain_block=256, persistence=0.0, seed=33, with_hidden=False,
+    )
+    window = 64
+
+    # the condition that broke the old metric is genuinely present here
+    assert len(np.unique(trace.routing[:window])) == trace.n_experts
+
+    result = analysis.domain_correlation(
+        trace, boundaries=[0, 256, 512, 768], window=window
+    )
+    assert result.within < 0.999, f"the metric saturated again: {result}"
+    assert result.separation > 0.0, str(result)
+
+
+def test_the_null_rejects_separation_that_is_only_temporal_locality():
+    """a corpus that never changes subject must not clear the null.
+
+    windows inside a block are adjacent in time, so persistence alone produces a
+    positive raw separation. that is the confound the circular shift exists to
+    strip, and this is the test that says it does.
+    """
+    trace = make_trace(
+        n_tokens=1600, n_layers=4, n_experts=32, top_k=4,
+        n_domains=1, domain_block=10_000, persistence=0.7, seed=34, with_hidden=False,
+    )
+    # the boundaries are a lie on purpose: the text never changed subject
+    null = analysis.domain_null(
+        trace, boundaries=[0, 400, 800, 1200], window=25, n_shifts=200
+    )
+
+    assert null.p_value > 0.05, (
+        f"there is no subject structure, only locality, so the shifted labels "
+        f"should explain the observed separation: {null}"
+    )
+
+
+def test_the_null_confirms_separation_that_was_planted():
+    trace = make_trace(
+        n_tokens=1600, n_layers=4, n_experts=32, top_k=4,
+        n_domains=4, domain_block=400, persistence=0.0, seed=35, with_hidden=False,
+    )
+    null = analysis.domain_null(
+        trace, boundaries=[0, 400, 800, 1200], window=25, n_shifts=200
+    )
+
+    assert null.p_value <= 0.01, str(null)
+    assert null.margin > 0.0, str(null)
+
+
+def test_the_replay_export_round_trips_the_way_rust_will_read_it(tmp_path):
+    """parse the export back the way `tests/replay.rs` does.
+
+    the rust side rebuilds an ExpertKey from a layer and an expert index rather
+    than reading a packed key, so the two sides cannot silently disagree about
+    the packing. this checks the byte layout that agreement rests on.
+    """
+    trace = make_trace(
+        n_tokens=40, n_layers=3, n_experts=8, top_k=2, seed=41, with_hidden=False
+    )
+    path = trace.write_replay(tmp_path / "t.route")
+    raw = path.read_bytes()
+
+    assert raw[0:8] == b"STRTRACE"
+    fields = np.frombuffer(raw[8:28], dtype="<u4")
+    version, n_tokens, n_layers, n_experts, top_k = fields.tolist()
+    assert version == 1
+    assert (n_tokens, n_layers, n_experts, top_k) == (40, 3, 8, 2)
+
+    body = np.frombuffer(raw[28:], dtype="<u2")
+    assert body.size == n_tokens * n_layers * top_k
+    np.testing.assert_array_equal(
+        body.reshape(n_tokens, n_layers, top_k).astype(np.int64), trace.routing
+    )
+
+
+def test_the_replay_export_refuses_more_experts_than_the_format_holds():
+    trace = make_trace(n_tokens=10, n_layers=2, n_experts=8, top_k=2, with_hidden=False)
+    trace.n_experts = 70_000
+    with pytest.raises(ValueError, match="u16"):
+        trace.write_replay("unused.route")
+
+
+def test_the_static_prior_is_the_bar_when_routing_ignores_the_token():
+    """a probe must be scored against the better of the two free baselines.
+
+    granite showed why. the persistence prior read 0.623 at k=4 and the static
+    frequency table read 0.718 on the same rows, so a probe at 0.752 looked like
+    it cleared the bar by 0.129 when the honest margin was 0.034. scoring
+    against the weaker baseline is how a project talks itself into shipping a
+    model that buys nothing.
+    """
+    # skew makes some experts far more popular, and no persistence at all, so a
+    # frequency table is the thing to beat and recency is not
+    trace = make_trace(
+        n_tokens=1200, n_layers=8, n_experts=32, top_k=4,
+        persistence=0.0, skew=3.0, signal=0.0, seed=36,
+    )
+    k4 = next(r for r in predict.lookahead_recall(trace) if r.k == 4)
+
+    assert k4.static > k4.persistence, (
+        f"a skewed router with no persistence should favour the frequency "
+        f"table: static {k4.static:.3f}, persistence {k4.persistence:.3f}"
+    )
+    assert k4.free_baseline() == max(k4.persistence, k4.static)
+    assert k4.margin() == k4.best_probe() - k4.free_baseline()
+
+
+def test_a_hidden_state_carrying_nothing_cannot_beat_the_free_baselines():
+    trace = make_trace(
+        n_tokens=1200, n_layers=8, n_experts=32, top_k=4,
+        persistence=0.0, skew=3.0, signal=0.0, seed=37,
+    )
+    k4 = next(r for r in predict.lookahead_recall(trace) if r.k == 4)
+
+    assert k4.margin() < 0.05, (
+        f"the hidden state carries no routing signal, so a probe should not "
+        f"clear the free baseline by anything worth shipping: {k4}"
+    )
+
+
+def test_the_null_is_empty_without_domains():
+    trace = make_trace(n_tokens=200, n_layers=2, n_experts=8, top_k=2, with_hidden=False)
+    assert analysis.domain_null(trace, boundaries=[0]).n_shifts == 0
