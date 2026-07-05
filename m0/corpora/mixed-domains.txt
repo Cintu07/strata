@@ -1,0 +1,161 @@
+This corpus exists to exercise the m0 capture path across clearly different
+subject matter. Routing in a mixture-of-experts model is claimed to be domain
+correlated, and that claim is the entire justification for the cache policy, so
+a corpus of uniform text would measure the wrong distribution and every number
+downstream would inherit the mistake. The blocks below are grouped by domain and
+separated by blank lines, which is the format the capture CLI expects.
+
+Provenance: written for this repository. It is short, so treat any single number
+derived from it as indicative rather than settled, and rerun against a larger
+corpus drawn from the workload you actually care about before quoting anything.
+
+DOMAIN ONE, SYSTEMS PROGRAMMING
+
+The allocator maintains a free list per size class, and each class holds spans
+of contiguous pages carved from a larger arena. When a thread requests memory,
+the fast path pops from a thread-local cache and touches no shared state at all.
+Only when that cache is empty does the request fall through to the central free
+list, which is protected by a lock held for as short an interval as possible.
+The design trades a small amount of memory overhead for the elimination of
+contention on the common path.
+
+Cache coherence protocols like MESI keep the view of memory consistent across
+cores, but they do so by moving cache lines between cores, and that movement is
+expensive. Two threads writing to different variables that happen to share a
+cache line will ping-pong that line back and forth even though they never touch
+the same data. This is false sharing, and the fix is padding: place the two
+variables on separate lines and the traffic disappears.
+
+Writing a lock-free queue correctly requires reasoning about memory ordering
+rather than just about atomicity. An atomic compare-and-swap guarantees that the
+read-modify-write happens indivisibly, but it says nothing on its own about
+whether other stores made before it are visible to a thread that observes the
+result. Acquire and release semantics are what tie the two together, and
+omitting them produces code that works on x86 and fails on ARM.
+
+Direct I/O bypasses the page cache entirely, which means the kernel imposes
+alignment requirements on the file offset, the transfer length, and the memory
+address of the buffer. Violating any of them returns EINVAL from a call that
+looks perfectly reasonable. The upside is that the application gets exactly the
+memory it asked for, with no second copy held by the operating system on its
+behalf.
+
+A submission queue and a completion queue shared between userspace and the
+kernel let an application issue many operations with a single system call. The
+depth of the queue is the parameter that matters most on flash storage: a device
+that delivers a hundred thousand operations per second at high queue depth may
+deliver only five thousand at queue depth one, because most of the time is spent
+waiting for a round trip rather than moving data.
+
+Profile-guided optimisation reorders the compiled code so that the hot path is
+contiguous in the instruction stream. The mechanism is the same one that makes
+data layout matter: fetching a line that will be used is free relative to
+fetching one that will not, so packing the frequently executed blocks together
+reduces the number of fetches the processor has to make.
+
+DOMAIN TWO, CLINICAL MEDICINE
+
+The patient presented with a three-day history of progressive dyspnoea on
+exertion, orthopnoea, and bilateral ankle swelling. On examination the jugular
+venous pressure was elevated, there were fine bibasal crackles on auscultation,
+and a third heart sound was audible at the apex. The clinical picture was
+consistent with decompensated heart failure, and an echocardiogram was requested
+to assess ventricular function.
+
+Antibiotic stewardship requires balancing the immediate benefit to an individual
+patient against the long-term cost of resistance to the population. Broad
+spectrum agents are appropriate as empirical therapy in a critically unwell
+patient, but should be narrowed once culture and sensitivity results return. The
+duration of therapy matters as much as the choice of agent, and there is
+consistent evidence that shorter courses are non-inferior for many common
+infections.
+
+Interpretation of a raised troponin requires clinical context. The assay is
+sensitive but not specific to acute coronary syndrome, and elevations occur in
+pulmonary embolism, sepsis, renal impairment, and myocarditis. A single value at
+presentation is less informative than the trajectory across serial measurements,
+and a rise-and-fall pattern in the setting of ischaemic symptoms is what supports
+the diagnosis of myocardial infarction.
+
+Informed consent is a process rather than a signature on a form. The clinician
+must convey the nature of the proposed intervention, the material risks, the
+reasonable alternatives including doing nothing, and the likely consequences of
+each. What counts as material is judged from the perspective of the particular
+patient, not from a general standard, and documentation should reflect the
+discussion that actually took place.
+
+Chronic kidney disease is staged by estimated glomerular filtration rate and by
+albuminuria, and the two together predict outcomes better than either alone. The
+principal aims of management are to slow progression, to manage the
+cardiovascular risk that accompanies renal impairment, and to prepare in good
+time for renal replacement therapy where progression to end-stage disease is
+anticipated.
+
+DOMAIN THREE, LAW AND CONTRACT
+
+A contract requires offer, acceptance, consideration, and an intention to create
+legal relations. An invitation to treat is not an offer, which is why goods
+displayed in a shop window may be withdrawn without liability. Acceptance must
+correspond exactly with the terms of the offer, and a purported acceptance that
+introduces new terms operates as a counter-offer, destroying the original.
+
+The doctrine of frustration discharges a contract where an unforeseen event
+renders performance impossible or radically different from what was undertaken.
+It is narrowly applied. Mere hardship, increased expense, or the fact that a
+contract has become unprofitable will not suffice, and a party who has assumed
+the risk of the event in question cannot rely on the doctrine to escape it.
+
+An exclusion clause is construed contra proferentem, meaning that ambiguity is
+resolved against the party seeking to rely on it. Statutory controls impose a
+further requirement of reasonableness in many commercial contexts and prohibit
+exclusion of liability for death or personal injury caused by negligence
+altogether. Incorporation must be established before construction is reached at
+all: a clause on the reverse of a receipt handed over after payment forms no part
+of the agreement.
+
+Damages for breach of contract aim to place the innocent party in the position
+they would have occupied had the contract been performed. Losses that are too
+remote are not recoverable, the test being whether the loss was within the
+reasonable contemplation of the parties at the time of contracting. A claimant is
+required to take reasonable steps to mitigate, and cannot recover for losses
+attributable to a failure to do so.
+
+Legal professional privilege protects communications between a client and their
+lawyer made for the dominant purpose of obtaining or giving legal advice. It
+belongs to the client and not to the lawyer, and once waived it cannot be
+selectively restored. The protection is close to absolute, and survives the
+termination of the retainer and the death of the client.
+
+DOMAIN FOUR, EVERYDAY NARRATIVE
+
+The kitchen smelled of burnt toast and coffee, which was how most mornings began
+in that house. She had learned to read the day from the state of the counter: if
+the bread bag was closed and the butter put away, her father had slept badly and
+risen early. If it was open, he had come down late and left in a hurry.
+
+They walked to the harbour because the bus did not run on Sundays. The tide was
+out and the boats sat at odd angles on the mud, their ropes slack. A man was
+scraping barnacles from a hull with the patience of someone who had done it many
+times before, and who expected to do it many times again.
+
+Nobody in the office admitted to having eaten the last of the biscuits, and the
+matter was allowed to drop after a week of small pointed remarks. It resurfaced
+in December, at the party, when someone had drunk enough to confess, and by then
+it had become the sort of joke that only works because everyone remembers being
+mildly annoyed about it at the time.
+
+The train was delayed for ninety minutes outside Reading and the announcements
+stopped after the first twenty. People had begun talking to each other by the
+end, which does not usually happen, and a woman across the aisle shared out a bag
+of sweets and told a long story about her sister's wedding that nobody had asked
+for and everybody listened to.
+
+He kept the letter for eleven years without answering it, moving it from flat to
+flat in a box with his passport and a broken watch. When he finally wrote back
+the address had changed twice and the reply came from a solicitor, which was not
+the ending he had spent eleven years imagining.
+
+Rain came in across the field in a visible line, the way it does in flat country,
+and they had about forty seconds to decide whether to run for the car or the
+barn. They chose the barn, which turned out to be the wrong choice, and spent an
+hour watching the water come through the roof in six separate places.
