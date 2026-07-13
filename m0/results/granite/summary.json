@@ -1,0 +1,127 @@
+{
+  "provenance": {
+    "source": "captured",
+    "model_id": "models/granite-1b-a400m",
+    "corpus": "corpora/mixed-domains.txt",
+    "created_at": 1788510358.3074746,
+    "notes": "24 routers hooked, top-8 of 32, hidden projected to 1024"
+  },
+  "is_real_measurement": true,
+  "reuse_overall": 0.4414262076172782,
+  "domain": {
+    "within": 0.9640368923421072,
+    "across": 0.8947539540934031,
+    "separation": 0.06928293824870413
+  },
+  "domain_null": {
+    "observed": 0.06928293824870413,
+    "null_mean": 0.04187594360541889,
+    "null_p95": 0.06282649502920867,
+    "margin": 0.006456443219495456,
+    "p_value": 0.004975124378109453,
+    "n_shifts": 200,
+    "aligned_discarded": 8
+  },
+  "gini_mean": 0.34862238495241415,
+  "coactivation": {
+    "concentration": 0.32334914002741305,
+    "lift": 1.5295601177491476
+  },
+  "hit_rate_at_target": {
+    "lru": 0.0,
+    "lfu": 0.39763231197771587,
+    "belady": 0.561298262921696
+  },
+  "lru_cliff": {
+    "per_token": 192,
+    "target_capacity": 153,
+    "lru_below": 0.1975926570721139,
+    "lru_at": 0.32721583874961313
+  },
+  "checks": [
+    {
+      "name": "expert reuse across consecutive tokens",
+      "verdict": "marginal",
+      "value": 0.4414262076172782,
+      "threshold": 0.5
+    },
+    {
+      "name": "router load imbalance",
+      "verdict": "pass",
+      "value": 0.34862238495241415,
+      "threshold": 0.3
+    },
+    {
+      "name": "co-activation lift over independent routing",
+      "verdict": "pass",
+      "value": 1.5295601177491476,
+      "threshold": 1.3
+    },
+    {
+      "name": "achievable hit rate at 20% of experts resident",
+      "verdict": "marginal",
+      "value": 0.561298262921696,
+      "threshold": 0.7
+    },
+    {
+      "name": "subject separation survives a circular shift null",
+      "verdict": "pass",
+      "value": 0.006456443219495456,
+      "threshold": 0.0
+    },
+    {
+      "name": "layer L+4 routing predicted from layer L",
+      "verdict": "marginal",
+      "value": 0.751857578754425,
+      "threshold": 0.9
+    },
+    {
+      "name": "probe beats the best free baseline at k=4",
+      "verdict": "fail",
+      "value": 0.03353327512741089,
+      "threshold": 0.05
+    }
+  ],
+  "prediction": [
+    {
+      "k": 1,
+      "budget": 16,
+      "persistence": 0.628339946269989,
+      "static": 0.7347640991210938,
+      "free_baseline": 0.7347640991210938,
+      "margin": 0.014419853687286377,
+      "linear": 0.7072536945343018,
+      "mlp": 0.7491839528083801
+    },
+    {
+      "k": 2,
+      "budget": 16,
+      "persistence": 0.6254310011863708,
+      "static": 0.7264987230300903,
+      "free_baseline": 0.7264987230300903,
+      "margin": 0.016948699951171875,
+      "linear": 0.7041232585906982,
+      "mlp": 0.7434474229812622
+    },
+    {
+      "k": 4,
+      "budget": 16,
+      "persistence": 0.6233456134796143,
+      "static": 0.7183243036270142,
+      "free_baseline": 0.7183243036270142,
+      "margin": 0.03353327512741089,
+      "linear": 0.7069659233093262,
+      "mlp": 0.751857578754425
+    },
+    {
+      "k": 8,
+      "budget": 16,
+      "persistence": 0.6313612461090088,
+      "static": 0.7236358523368835,
+      "free_baseline": 0.7236358523368835,
+      "margin": 0.035240888595581055,
+      "linear": 0.7150372266769409,
+      "mlp": 0.7588767409324646
+    }
+  ]
+}
