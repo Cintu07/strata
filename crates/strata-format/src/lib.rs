@@ -73,6 +73,7 @@ mod header;
 mod index;
 mod plan;
 mod reader;
+pub mod trace;
 mod types;
 mod writer;
 
@@ -80,6 +81,7 @@ pub use error::{Error, Result};
 pub use header::Header;
 pub use plan::{PlanOptions, ReadPlan, ReadRequest};
 pub use reader::LayoutReader;
+pub use trace::{RouteTrace, TraceError};
 pub use types::{CoactivationEdge, ExpertEntry, ExpertKey, Precision};
 pub use writer::LayoutWriter;
 
