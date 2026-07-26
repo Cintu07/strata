@@ -131,6 +131,107 @@ impl Policy for LruCache {
     }
 }
 
+/// least frequently used over the whole run, with no decay.
+///
+/// this is the baseline that actually matters on a real decoder trace, and it
+/// was missing from this crate for a while, which flattered strata.
+///
+/// lru is the policy every paper in this space reports against, but on a real
+/// routing trace lru is not a competitor, it is a pathology: a token touches
+/// `n_layers * top_k` distinct pairs, so any cache smaller than that sees a
+/// cyclic scan and lru returns exactly zero. beating a policy that scores zero
+/// proves nothing about the eviction score. frequency is what survives the scan
+/// and therefore what strata has to actually beat.
+///
+/// no decay at all, so it ossifies on a topic switch. that is a real failure
+/// mode and it is left in rather than tuned away, because a baseline that has
+/// been tuned is not a baseline.
+#[derive(Debug)]
+pub struct LfuCache {
+    capacity_bytes: u64,
+    resident_bytes: u64,
+    freq: HashMap<ExpertKey, u64>,
+    sizes: HashMap<ExpertKey, u64>,
+    stats: CacheStats,
+}
+
+impl LfuCache {
+    /// an lfu cache of the given size.
+    #[must_use]
+    pub fn new(capacity_bytes: u64) -> Self {
+        Self {
+            capacity_bytes,
+            resident_bytes: 0,
+            freq: HashMap::new(),
+            sizes: HashMap::new(),
+            stats: CacheStats::default(),
+        }
+    }
+
+    /// least frequent resident key, ties broken by packed key so the result
+    /// does not depend on hash iteration order.
+    fn victim(&self) -> Option<ExpertKey> {
+        self.sizes
+            .keys()
+            .min_by_key(|k| (self.freq.get(k).copied().unwrap_or(0), k.packed()))
+            .copied()
+    }
+}
+
+impl Policy for LfuCache {
+    fn name(&self) -> &'static str {
+        "lfu"
+    }
+
+    fn access(&mut self, key: ExpertKey, desc: ExpertDesc) -> bool {
+        *self.freq.entry(key).or_insert(0) += 1;
+
+        if self.sizes.contains_key(&key) {
+            self.stats.hits += 1;
+            return true;
+        }
+        self.stats.misses += 1;
+        self.stats.bytes_missed += desc.stored_bytes;
+
+        if desc.stored_bytes > self.capacity_bytes {
+            self.stats.rejected_oversized += 1;
+            return false;
+        }
+
+        let incoming = self.freq.get(&key).copied().unwrap_or(0);
+        while self.resident_bytes + desc.stored_bytes > self.capacity_bytes {
+            let Some(victim) = self.victim() else {
+                break;
+            };
+            // an incoming key that is rarer than the rarest resident does not
+            // earn the slot. without this, lfu degenerates to a scan-driven
+            // cache on exactly the traces frequency is supposed to survive.
+            if self.freq.get(&victim).copied().unwrap_or(0) > incoming {
+                return false;
+            }
+            if let Some(bytes) = self.sizes.remove(&victim) {
+                self.resident_bytes -= bytes;
+                self.stats.evictions += 1;
+                self.stats.bytes_evicted += bytes;
+            }
+        }
+
+        self.sizes.insert(key, desc.stored_bytes);
+        self.resident_bytes += desc.stored_bytes;
+        self.stats.admissions += 1;
+        self.stats.bytes_admitted += desc.stored_bytes;
+        false
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    fn stats(&self) -> &CacheStats {
+        &self.stats
+    }
+}
+
 /// strata's policy with admission control switched off, so that the effect of
 /// admission can be separated from the effect of the eviction score.
 ///
