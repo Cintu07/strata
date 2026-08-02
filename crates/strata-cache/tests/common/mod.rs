@@ -1,10 +1,14 @@
-//! synthetic access traces with the structure real router traces are claimed to
-//! have, so that policy comparisons here mean something before m0 lands.
+//! synthetic access traces with a known shape, used to check that a policy
+//! responds to that shape the way the design says it should.
 //!
-//! these are not measurements. they are workloads with a known shape, used to
-//! check that a policy responds to that shape the way the design says it
-//! should. the real traces come from the m0 harness, and the same policies are
-//! replayed against them there.
+//! these are not measurements. they were once described as having "the
+//! structure real router traces are claimed to have", and m0 has since shown
+//! that claim was incomplete: none of these generators produce the cyclic scan
+//! over one token's working set that a real decoder produces, and that scan is
+//! what takes lru to exactly zero. read `tests/replay.rs` for the real trace.
+//! these workloads isolate one property each, which is what they are for.
+
+#![allow(dead_code)] // each test binary uses a different subset of these
 
 use std::collections::HashMap;
 use strata_format::ExpertKey;
