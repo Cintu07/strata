@@ -22,6 +22,14 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
+# the real-trace replay is ignored by default: it pushes 413k accesses through
+# five policies and an offline optimum, which is seconds in release and minutes
+# in debug. it is the only place the shipping cache meets real routing, so it
+# runs here rather than being left to whoever remembers.
+echo
+echo "== cache against the real trace =="
+cargo test -p strata-cache --test replay --release -- --ignored
+
 echo
 echo "== m0 =="
 if python3 -c "import pytest" 2>/dev/null; then
