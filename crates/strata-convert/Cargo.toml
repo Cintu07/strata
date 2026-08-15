@@ -1,0 +1,15 @@
+[package]
+name = "strata-convert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "turn a safetensors model into a strata layout file"
+
+[dependencies]
+strata-format = { path = "../strata-format" }
+strata-layout = { path = "../strata-layout" }
+
+[lints]
+workspace = true
