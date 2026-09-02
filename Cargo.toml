@@ -7,6 +7,7 @@ members = [
     "crates/strata-io",
     "crates/strata-prefill",
     "crates/strata-bench",
+    "crates/strata-convert",
 ]
 
 [workspace.package]

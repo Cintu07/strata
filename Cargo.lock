@@ -50,6 +50,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-convert"
+version = "0.1.0"
+dependencies = [
+ "strata-format",
+ "strata-layout",
+]
+
+[[package]]
 name = "strata-format"
 version = "0.1.0"
 
