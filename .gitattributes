@@ -1,0 +1,5 @@
+# keep line endings LF in the repo. scripts/test.sh is executed by bash inside
+# wsl, and a CRLF shebang line makes it fail with a confusing "bad interpreter".
+* text=auto eol=lf
+*.png binary
+*.npz binary
