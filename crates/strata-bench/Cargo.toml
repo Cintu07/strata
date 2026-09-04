@@ -1,0 +1,19 @@
+[package]
+name = "strata-bench"
+description = "end to end measurement: what the layout, the reordering and the io path are worth together"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+strata-format = { path = "../strata-format" }
+strata-cache = { path = "../strata-cache" }
+strata-layout = { path = "../strata-layout" }
+strata-prefill = { path = "../strata-prefill" }
+strata-io = { path = "../strata-io" }
+
+[lints]
+workspace = true

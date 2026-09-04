@@ -1,0 +1,17 @@
+[package]
+name = "strata-io"
+description = "async expert reads: io_uring with O_DIRECT on linux, positional reads everywhere else"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -4,6 +4,9 @@ members = [
     "crates/strata-format",
     "crates/strata-cache",
     "crates/strata-layout",
+    "crates/strata-io",
+    "crates/strata-prefill",
+    "crates/strata-bench",
 ]
 
 [workspace.package]
@@ -15,7 +18,10 @@ repository = "https://github.com/Cintu07/strata"
 
 [workspace.lints.rust]
 missing_docs = "warn"
-unsafe_code = "forbid"
+# deny rather than forbid, so that strata-io can allow it locally. it talks to
+# io_uring, where handing the kernel a raw buffer pointer is the entire job.
+# every other crate in the workspace is unsafe free and should stay that way.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

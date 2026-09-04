@@ -8,18 +8,58 @@ that positioning is deliberate and narrow. ktransformers, freetoken, llama.cpp a
 
 ## status
 
-**pre-m0.** the engine does not exist yet, and it should not until m0 says it is worth building.
-
-what is here is the foundation m0 and the storage design need, all of it tested and none of it stubbed:
+**pre-m0 on the model side, m2 and m4 built and measured on the engine side.**
+the engine proper does not exist and should not until m0 answers.
 
 | crate | what it does |
 |---|---|
 | [`strata-format`](crates/strata-format) | the on-disk expert layout file: 4kb-aligned contiguous experts, an index carrying offsets, checksums, per-expert precision and the co-activation graph, and a read planner that turns a scattered want-set into a few large sequential transfers |
 | [`strata-cache`](crates/strata-cache) | the expert cache: a probationary window in front of a greedy-dual-size-frequency main region with tinylfu admission, plus the lru and belady baselines it is measured against |
 | [`strata-layout`](crates/strata-layout) | the profile-guided placement pass: greedy chain merging over the measured co-activation graph, so experts that fire together are neighbours on disk |
+| [`strata-io`](crates/strata-io) | the storage tier: `io_uring` with `O_DIRECT` on linux, positional reads elsewhere, behind one submit-then-wait interface |
+| [`strata-prefill`](crates/strata-prefill) | expert-centric prefill: read each expert once per layer instead of once per token, bit identically to the reference |
+| [`strata-bench`](crates/strata-bench) | the end to end measurement |
 | [`m0/`](m0) | the measurement harness: the go/no-go gate for the entire project |
 
-no external dependencies in any of the three crates. `cargo test` works offline.
+only `strata-io` has dependencies, and only on linux. everything else is std
+only, so the workspace builds and tests offline.
+
+## what the mechanisms are actually worth
+
+measured, reproducible from the repo, on synthetic weights so this is the io path
+and the scheduling rather than a model.
+
+**expert-centric prefill**, `cargo run --release -p strata-bench --bin prefill`.
+1024 tokens, 4 layers, top-8 of 128 experts at 2 MiB each:
+
+```
+stage             reads   bytes read      GB/s    time ms
+token-major       32768       65536 M      2.78    24685.9   extrapolated from 12%
+expert-major        482         964 M      3.47      291.4   measured in full
++ coalesced          43         964 M      3.37      300.2   measured in full
++ warm cache        373         746 M      3.27      239.4   measured in full
+```
+
+68x fewer reads, 68x fewer bytes, about 85x less time.
+
+**the device**, `cargo run --release -p strata-io --bin bandwidth`:
+
+```
+sequential      1M   16     3.514 GB/s
+random          4K    1     0.023 GB/s
+random          4K  128     0.406 GB/s
+random          1M    4     3.843 GB/s
+```
+
+queue depth is worth 18x on small random reads, which is why the storage
+interface is submit-then-wait and not a blocking `read_at`. and **random 1 MiB
+matches sequential 1 MiB**, which reframed what the layout is for: the goal is
+large reads, not contiguous ones. see [decision 0009](docs/decisions/0009-large-reads-not-merely-sequential.md).
+
+that same result explains the coalesced row above saving nothing. at 2 MiB an
+expert is already past the size where request count matters, so coalescing earns
+its place on small experts, not large ones. reporting that rather than quietly
+dropping the row is the standard this repo tries to hold.
 
 ## the go/no-go gate
 
@@ -74,9 +114,21 @@ the point of building measurement in first is that it talks back. two examples f
 
 ## where the honest limits are
 
-- **strata loses to lru on pure short-range recency.** a workload where a topic runs long enough to turn the whole cache over, with no reuse across topics, is lru's best case, and admission control is a cost there. this is asserted as a test rather than left out of the readme: see `a_pure_recency_workload_is_where_lru_still_wins`.
-- **belady is exactly optimal only for uniform expert sizes.** across layers of differing width it is a close estimate of the ceiling, not a proof.
-- **no io_uring backend yet.** the format and the read planner are built for it and the reader uses positional reads with no shared cursor, but m2 is where the direct-io path gets written and where achieved bandwidth gets verified against device spec.
+- **strata loses to lru on pure short-range recency.** a workload where a topic
+  runs long enough to turn the whole cache over, with no reuse across topics, is
+  lru's best case, and admission control is a cost there. this is asserted as a
+  test rather than left out of the readme: see
+  `a_pure_recency_workload_is_where_lru_still_wins`.
+- **coalescing did not pay on the benchmark above**, for the reason in decision
+  0009. it is kept because the case it helps is small experts, which is where
+  the fine-grained-expert model families and the low bit quantisations live.
+- **belady is exactly optimal only for uniform expert sizes.** across layers of
+  differing width it is a close estimate of the ceiling, not a proof.
+- **the storage numbers were measured inside wsl2**, so an ext4 volume on a
+  virtual disk on ntfs. the shape of the curve is real; the absolute peak is a
+  lower bound on the bare device.
+- **nothing here has touched a real model yet.** no converter from gguf or
+  safetensors, no attention, no kernels, no decode loop. m0 comes first.
 
 ## documents
 
