@@ -5,16 +5,26 @@ lazily so that the analysis half of the harness runs without them.
 
 # how it works
 
-moe implementations differ, but they all have a router: a small linear layer,
-one per block, that maps the hidden state to per-expert scores. a forward hook
-on that module sees both the input it was given and the logits it produced,
+moe implementations differ, but they all have a router: a small module, one per
+block, that maps the hidden state to per-expert scores and picks the top-k. a
+forward hook on it sees both the input it was given and the decision it made,
 which is exactly the pair the speculative router head would have to learn.
 
-the router modules are found by name rather than by walking a known architecture,
-because the names differ between families and the shapes do not. anything that
-is a `Linear` whose output width equals the model's expert count, sitting inside
-a block, is a router. that heuristic is checked against the config and the module
-count, and it refuses rather than guesses if the result looks wrong.
+# the two things that make this harder than it sounds
+
+**a router is not always a `Linear`.** granitemoe's `GraniteMoeTopKRouter` holds
+a bare weight and calls `F.linear` itself, so a search for `nn.Linear` modules
+finds the attention projections and no routers at all. discovery therefore keys
+on the module's position and class name, and then *verifies* that it can produce
+an output of the right width.
+
+**a router does not always return logits.** mixtral's gate returns
+`(num_tokens, num_experts)` logits. granitemoe's returns a three tuple of
+`(top_k_index, top_k_weights, router_logits)`, so taking element zero and running
+top-k over it treats expert *indices* as scores and records confident nonsense.
+that failure produces a complete, well shaped, entirely fictional trace, which is
+the worst kind. so the extraction identifies tensors by dtype and width rather
+than by position, and prefers the router's own choice when it offers one.
 
 # hidden states are large
 
@@ -55,6 +65,39 @@ class CaptureConfig:
     extra_model_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
+def extract_routing(output: Any, n_experts: int, top_k: int) -> tuple[str, Any]:
+    """pull the routing decision out of whatever the router returned.
+
+    identifies tensors by dtype and width rather than by position in the return
+    value, because that position differs between families and getting it wrong
+    is silent.
+
+    returns `("chosen", indices)` when the router hands over its own top-k, which
+    is preferred because it is authoritative and cannot disagree with the model
+    over a tie. otherwise `("logits", scores)` and the caller takes the top-k.
+
+    raises if neither is present, rather than returning something plausible.
+    """
+    import torch
+
+    tensors = output if isinstance(output, (tuple, list)) else [output]
+    tensors = [t for t in tensors if torch.is_tensor(t)]
+
+    for t in tensors:
+        if not t.is_floating_point() and t.shape[-1] == top_k:
+            return "chosen", t
+    for t in tensors:
+        if t.is_floating_point() and t.shape[-1] == n_experts:
+            return "logits", t
+
+    shapes = [(tuple(t.shape), str(t.dtype)) for t in tensors]
+    raise RuntimeError(
+        f"a router returned nothing that looks like a routing decision. "
+        f"expected an integer tensor of width {top_k} or a float tensor of "
+        f"width {n_experts}, got {shapes}"
+    )
+
+
 class RouterCapture:
     """hooks a model's routers and accumulates a trace.
 
@@ -78,9 +121,9 @@ class RouterCapture:
         self._hidden: list[np.ndarray] = []
         self._projection: np.ndarray | None = None
         self._pending: dict[int, tuple[np.ndarray, np.ndarray | None]] = {}
-        self.routers = find_routers(model)
-        self.n_experts = infer_n_experts(model, self.routers)
+        self.n_experts = infer_n_experts(model)
         self.top_k = config.top_k or infer_top_k(model)
+        self.routers = find_routers(model, self.n_experts)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -100,13 +143,18 @@ class RouterCapture:
         def hook(_module: Any, inputs: tuple, output: Any) -> None:
             with torch.no_grad():
                 hidden = inputs[0].detach()
-                logits = output[0] if isinstance(output, tuple) else output
-                logits = logits.detach()
-
                 hidden = hidden.reshape(-1, hidden.shape[-1]).float().cpu().numpy()
-                logits = logits.reshape(-1, logits.shape[-1]).float().cpu().numpy()
 
-                chosen = np.argpartition(-logits, self.top_k - 1, axis=1)[:, : self.top_k]
+                kind, tensor = extract_routing(output, self.n_experts, self.top_k)
+                tensor = tensor.detach().reshape(-1, tensor.shape[-1]).cpu()
+                if kind == "chosen":
+                    # the router's own decision, which cannot disagree with the
+                    # model about a tie
+                    chosen = tensor.numpy()
+                else:
+                    scores = tensor.float().numpy()
+                    chosen = np.argpartition(-scores, self.top_k - 1, axis=1)[:, : self.top_k]
+
                 projected = None
                 if self.config.probe_dim > 0:
                     projected = self._project(hidden)
@@ -169,46 +217,104 @@ class RouterCapture:
 # --------------------------------------------------------------- discovery
 
 
-def find_routers(model: Any) -> list[tuple[str, Any]]:
-    """locate every router module, by shape and position rather than by name.
+#: attribute names a decoder block gives its router, across families
+ROUTER_LEAVES = {"router", "gate", "gating", "switch", "gate_proj_router"}
 
-    names differ across model families and shapes do not, so the search is for
-    a small linear layer inside a decoder block whose output width matches the
-    expert count. the result is checked against the block count, and this
-    raises rather than guessing if the two disagree.
+#: substrings that identify a router by its class name
+ROUTER_CLASS_HINTS = ("router", "gating", "topkgate", "moegate")
+
+
+def _can_emit(module: Any, n_experts: int) -> bool:
+    """whether this module could plausibly produce `n_experts` scores.
+
+    the verification step. without it, anything called `gate` gets hooked,
+    including the gate projection of an ordinary swiglu mlp, which has nothing
+    to do with routing and would fill the trace with garbage.
     """
     import torch.nn as nn
 
+    if isinstance(module, nn.Linear):
+        return module.out_features == n_experts
+
+    weight = getattr(module, "weight", None)
+    if weight is not None and getattr(weight, "ndim", 0) >= 1 and weight.shape[0] == n_experts:
+        return True
+
+    return any(
+        isinstance(child, nn.Linear) and child.out_features == n_experts
+        for child in module.modules()
+    )
+
+
+def find_routers(model: Any, n_experts: int | None = None) -> list[tuple[str, Any]]:
+    """locate every router module.
+
+    a candidate has to look like a router *and* be able to emit one score per
+    expert. the name test alone is not enough, because a swiglu mlp calls one of
+    its projections a gate, and the width test alone is not enough either, since
+    plenty of matrices happen to have that many rows.
+
+    raises rather than guessing whenever the result is ambiguous. a wrong hook
+    point produces a complete and entirely fictional trace, so failing loudly is
+    much cheaper than the alternative.
+    """
+    if n_experts is None:
+        n_experts = infer_n_experts(model)
+
     candidates: list[tuple[str, Any]] = []
     for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear) or module.bias is not None:
+        if not name:
             continue
-        lowered = name.lower()
-        if any(tag in lowered for tag in ("gate", "router", "switch")) and "proj" not in lowered:
+        leaf = name.rsplit(".", 1)[-1].lower()
+        cls = type(module).__name__.lower()
+        looks_right = leaf in ROUTER_LEAVES or any(h in cls for h in ROUTER_CLASS_HINTS)
+        if not looks_right:
+            continue
+        if "proj" in leaf and leaf not in ROUTER_LEAVES:
+            continue
+        if _can_emit(module, n_experts):
             candidates.append((name, module))
+
+    # when a router module contains the linear that does the work, both match.
+    # keep the inner one, whose output is the logits and nothing else.
+    names = {n for n, _ in candidates}
+    candidates = [
+        (n, m)
+        for n, m in candidates
+        if not any(other != n and other.startswith(n + ".") for other in names)
+    ]
 
     if not candidates:
         raise RuntimeError(
             "no router modules found. this model may not be a mixture of experts, "
             "or it may name its routers in a way this heuristic does not cover. "
-            "pass the modules explicitly rather than letting it guess."
-        )
-    widths = {m.out_features for _, m in candidates}
-    if len(widths) != 1:
-        raise RuntimeError(
-            f"found candidate routers with differing output widths {sorted(widths)}, "
-            "which means the heuristic caught something that is not a router"
+            "pass the modules explicitly rather than letting it guess, because a "
+            "wrong hook point produces a complete trace of fictional numbers."
         )
     return candidates
 
 
-def infer_n_experts(model: Any, routers: list[tuple[str, Any]]) -> int:
-    """expert count, from the config where possible and the router shape if not."""
-    for attr in ("num_local_experts", "num_experts", "n_routed_experts", "moe_num_experts"):
+def infer_n_experts(model: Any) -> int:
+    """expert count, from the config.
+
+    read from the config rather than from a weight shape, because the shape is
+    only meaningful once the right module has been found and finding the right
+    module needs this number.
+    """
+    for attr in (
+        "num_local_experts",
+        "num_experts",
+        "n_routed_experts",
+        "moe_num_experts",
+        "num_experts_per_layer",
+    ):
         value = getattr(model.config, attr, None)
         if isinstance(value, int) and value > 0:
             return value
-    return int(routers[0][1].out_features)
+    raise RuntimeError(
+        "could not read the expert count from the model config. pass it "
+        "explicitly rather than letting it guess."
+    )
 
 
 def infer_top_k(model: Any) -> int:
