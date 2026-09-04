@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # the three crates have no external dependencies, so there is nothing to
+      # restore and nothing to invalidate. see docs/decisions/0007.
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - run: cargo test --workspace
+
+      # the doctests in every crate root are the worked examples from the
+      # readme, so a stale example fails the build rather than misleading someone
+      - run: cargo test --workspace --doc
+
+  m0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # base install only. torch and transformers are the [capture] extra and
+      # are not needed to test the analysis half of the harness, which is the
+      # half with the logic in it.
+      - run: pip install -e "m0[dev]"
+
+      - run: python -m pytest m0/tests -q
+
+      # the pipeline has to survive being run, not just unit tested
+      - name: end to end on a synthetic trace
+        working-directory: m0
+        run: |
+          python -m strata_m0 synth --out traces/ci.npz --tokens 800 --layers 6 --experts 24
+          python -m strata_m0 analyse --trace traces/ci.npz --out results/ci
+          test -f results/ci/report.md
+          test -f results/ci/summary.json
+          grep -q "this is not a measurement" results/ci/report.md

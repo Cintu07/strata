@@ -1,0 +1,19 @@
+# rust
+/target
+**/*.rs.bk
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# m0 outputs: traces are large and results are regenerated from them
+m0/traces/
+m0/results/
+
+# editors and os
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strata-m0"
+version = "0.1.0"
+description = "the strata m0 measurement harness: does the structure the design depends on exist"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy>=1.24", "matplotlib>=3.7"]
+
+[project.optional-dependencies]
+capture = ["torch>=2.1", "transformers>=4.40", "safetensors>=0.4"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+strata-m0 = "strata_m0.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["strata_m0*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
